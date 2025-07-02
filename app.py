@@ -51,7 +51,7 @@ POI_TYPES = {
     "Museum": {'tourism': 'museum'}
 }
 
-# LocationAnalyzer class (from previous implementation)
+# LocationAnalyzer class (keep all existing methods unchanged)
 class LocationAnalyzer:
     """Location analysis tool with progressive filtering and proper travel mode support."""
     
@@ -180,10 +180,10 @@ class LocationAnalyzer:
             )
     
     def add_two_stage_location_criterion(self,
-                                    specific_location: str,
-                                    max_time_minutes: int,
-                                    travel_mode: str,
-                                    criterion_name: str) -> gpd.GeoDataFrame:
+                                       specific_location: str,
+                                       max_time_minutes: int,
+                                       travel_mode: str,
+                                       criterion_name: str) -> gpd.GeoDataFrame:
         """Two-stage search for specific locations: buffer first, then network analysis."""
         st.info(f"🔍 Two-stage search for {specific_location}")
         
@@ -191,7 +191,7 @@ class LocationAnalyzer:
         speed_mph = self.TRAVEL_SPEEDS[travel_mode]
         max_distance_miles = (max_time_minutes / 60) * speed_mph
         adjustment = self.BUFFER_ADJUSTMENTS[travel_mode]
-        buffer_distance = max_distance_miles * adjustment
+        buffer_distance = max_distance_miles * adjustment  # Slightly larger buffer for safety
         
         # Get the specific location
         pois = self._get_pois(None, specific_location)
@@ -216,39 +216,28 @@ class LocationAnalyzer:
             location_point = pois.geometry.iloc[0]
             
             # Download street network for the buffer area only
-            # IMPORTANT: Use correct network type for each mode
             network_type = 'walk' if travel_mode == 'walk' else 'drive'
             
             G = ox.graph_from_polygon(
-                stage1_area,  # Use the stage 1 area, not the full buffer
+                stage1_area,
                 network_type=network_type,
                 simplify=True
             )
             
-            # Add travel time to edges (this is crucial for correct calculations)
-            # Convert edge lengths to travel time in seconds
+            # Add travel time to edges
             for u, v, data in G.edges(data=True):
-                # length is in meters
                 length_meters = data['length']
                 
-                # Convert to travel time based on mode
                 if travel_mode == 'walk':
-                    # Walking: 3 mph = 1.34 m/s
                     travel_time_seconds = length_meters / 1.34
                 elif travel_mode == 'bike':
-                    # Biking: 12 mph = 5.36 m/s
                     travel_time_seconds = length_meters / 5.36
                 else:  # drive
-                    # Driving: Need to consider road type for accurate speeds
-                    # Default to 55 mph  for now
-                    # In reality, should use road class (highway vs residential)
                     if 'highway' in data:
-                        # Adjust speed based on road type
                         road_type = data['highway']
                         if isinstance(road_type, list):
                             road_type = road_type[0]
                         
-                        # Speed limits by road type (mph)
                         speed_limits = {
                             'motorway': 65,
                             'trunk': 55,
@@ -261,9 +250,9 @@ class LocationAnalyzer:
                         }
                         
                         speed_mph = speed_limits.get(road_type, 55)
-                        speed_mps = speed_mph * 0.44704  # Convert mph to m/s
+                        speed_mps = speed_mph * 0.44704
                     else:
-                        speed_mps = 55 * 0.44704  # Default 55 mph
+                        speed_mps = 24.6  # Default 55 mph
                     
                     travel_time_seconds = length_meters / speed_mps
                 
@@ -273,19 +262,17 @@ class LocationAnalyzer:
             location_node = ox.nearest_nodes(G, location_point.x, location_point.y)
             
             # Calculate travel times from this node
-            # Use travel_time as weight, not length!
             max_time_seconds = max_time_minutes * 60
             
             travel_times = nx.single_source_dijkstra_path_length(
                 G, 
                 location_node, 
                 cutoff=max_time_seconds,
-                weight='travel_time'  # Use travel time, not distance!
+                weight='travel_time'
             )
             
             # Create isochrone from reachable nodes
             if travel_times:
-                # Get coordinates of all reachable nodes
                 node_coords = []
                 for node, time_seconds in travel_times.items():
                     if time_seconds <= max_time_seconds:
@@ -293,37 +280,29 @@ class LocationAnalyzer:
                         node_coords.append([node_data['x'], node_data['y']])
                 
                 if len(node_coords) > 2:
-                    # Create a more accurate isochrone using alpha shape or concave hull
                     from shapely.geometry import MultiPoint
                     from shapely.ops import unary_union
                     
                     points = MultiPoint([Point(coord) for coord in node_coords])
                     
-                    # For driving, use convex hull (simpler but still accurate)
-                    # For walking/biking, could use alpha shape for more detail
                     if travel_mode == 'drive':
                         isochrone = points.convex_hull
                     else:
-                        # Use buffer + union for more organic shape
                         buffer_size = 0.001 if travel_mode == 'walk' else 0.002
                         buffered_points = [Point(coord).buffer(buffer_size) for coord in node_coords]
                         isochrone = unary_union(buffered_points).convex_hull
                     
-                    # Intersect with current search area
                     result_geometry = isochrone.intersection(self.current_search_area)
                     
                     st.success(f"✅ Stage 2: Network analysis complete ({len(node_coords)} reachable nodes)")
                 else:
-                    # Not enough reachable nodes
                     st.warning("⚠️ Too few reachable nodes found, using buffer method")
                     result_geometry = stage1_area
             else:
-                # No reachable nodes found
                 st.warning("⚠️ No reachable areas found via network, using buffer method")
                 result_geometry = stage1_area
                 
         except Exception as e:
-            # If network analysis fails, use the buffer result
             st.warning(f"⚠️ Network analysis failed: {str(e)[:100]}... Using buffer method.")
             result_geometry = stage1_area
         
@@ -339,8 +318,7 @@ class LocationAnalyzer:
         st.info(f"✅ Applied {criterion_name}. New area: {area_sq_miles:.1f} sq miles")
         
         return gpd.GeoDataFrame([{'geometry': result_geometry}], crs=self.crs)
-
-
+    
     def _simple_travel_buffer(self, poi_type, specific_location, 
                              max_distance_miles, travel_mode, criterion_name):
         """Simple buffer adjusted for travel mode."""
@@ -492,7 +470,7 @@ with st.sidebar:
     
     st.divider()
     
-    # Rows 2-5: Amenity criteria
+    # Rows 2-5: Amenity criteria (UPDATED - only distance option)
     st.subheader("2. Amenity Criteria")
     amenity_criteria = []
     
@@ -504,25 +482,22 @@ with st.sidebar:
                 key=f"poi_{i}"
             )
             
-            col1, col2 = st.columns(2)
-            with col1:
-                mode = st.selectbox(
-                    "Mode",
-                    options=["distance", "walk", "bike", "drive"],
-                    key=f"mode_{i}"
-                )
-            with col2:
-                if mode == "distance":
-                    value = st.number_input("Miles", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key=f"value_{i}")
-                else:
-                    value = st.number_input("Minutes", min_value=1, max_value=60, value=10, step=1, key=f"value_{i}")
+            # Only show distance option for amenities
+            distance_value = st.number_input(
+                "Distance (miles)", 
+                min_value=0.1, 
+                max_value=10.0, 
+                value=1.0, 
+                step=0.1, 
+                key=f"amenity_distance_{i}"
+            )
             
             if poi_name != "None":
                 amenity_criteria.append({
                     'poi_type': POI_TYPES[poi_name],
                     'poi_name': poi_name,
-                    'mode': mode,
-                    'value': value
+                    'mode': 'distance',
+                    'value': distance_value
                 })
     
     st.divider()
@@ -567,44 +542,75 @@ if analyze_button:
         with st.spinner("Initializing search area..."):
             st.session_state.analyzer = LocationAnalyzer(center_location, max_radius)
         
-        # Apply amenity criteria
+        # Apply amenity criteria (all are distance-based now)
         for idx, criterion in enumerate(amenity_criteria):
             with st.spinner(f"Analyzing {criterion['poi_name']}..."):
-                criterion_name = f"{criterion['poi_name']}_{criterion['mode']}"
+                criterion_name = f"{criterion['poi_name']}_distance"
                 
-                if criterion['mode'] == 'distance':
-                    st.session_state.analyzer.add_simple_buffer_criterion(
-                        poi_type=criterion['poi_type'],
-                        max_distance_miles=criterion['value'],
-                        criterion_name=criterion_name
-                    )
-                else:
-                    st.session_state.analyzer.add_travel_time_criterion(
-                        poi_type=criterion['poi_type'],
-                        max_time_minutes=int(criterion['value']),
-                        travel_mode=criterion['mode'],
-                        criterion_name=criterion_name,
-                        use_network=False  # Always use simple method for speed
-                    )
+                st.session_state.analyzer.add_simple_buffer_criterion(
+                    poi_type=criterion['poi_type'],
+                    max_distance_miles=criterion['value'],
+                    criterion_name=criterion_name
+                )
         
-        # Apply location criteria with TWO-STAGE SEARCH
-        for idx, criterion in enumerate(location_criteria):
-            with st.spinner(f"Analyzing {criterion['location']}..."):
-                criterion_name = f"{criterion['location'][:20]}_{criterion['mode']}"
+        # UPDATED: Process location criteria in stages
+        # First, separate criteria by mode
+        distance_criteria = [c for c in location_criteria if c['mode'] == 'distance']
+        walk_criteria = [c for c in location_criteria if c['mode'] == 'walk']
+        bike_criteria = [c for c in location_criteria if c['mode'] == 'bike']
+        drive_criteria = [c for c in location_criteria if c['mode'] == 'drive']
+        
+        # Stage 1: Process all distance-based criteria first
+        st.subheader("Stage 1: Distance-based filtering")
+        for criterion in distance_criteria:
+            with st.spinner(f"Analyzing {criterion['location']} (distance)..."):
+                criterion_name = f"{criterion['location'][:20]}_distance"
                 
-                if criterion['mode'] == 'distance':
-                    # For distance mode, use simple buffer as before
-                    st.session_state.analyzer.add_simple_buffer_criterion(
-                        specific_location=criterion['location'],
-                        max_distance_miles=criterion['value'],
-                        criterion_name=criterion_name
-                    )
-                else:
-                    # For travel modes, use two-stage search
+                st.session_state.analyzer.add_simple_buffer_criterion(
+                    specific_location=criterion['location'],
+                    max_distance_miles=criterion['value'],
+                    criterion_name=criterion_name
+                )
+        
+        # Stage 2: Process walk criteria with two-stage search
+        if walk_criteria:
+            st.subheader("Stage 2: Walking distance analysis")
+            for criterion in walk_criteria:
+                with st.spinner(f"Analyzing {criterion['location']} (walk)..."):
+                    criterion_name = f"{criterion['location'][:20]}_walk"
+                    
                     st.session_state.analyzer.add_two_stage_location_criterion(
                         specific_location=criterion['location'],
                         max_time_minutes=int(criterion['value']),
-                        travel_mode=criterion['mode'],
+                        travel_mode='walk',
+                        criterion_name=criterion_name
+                    )
+        
+        # Stage 3: Process bike criteria with two-stage search
+        if bike_criteria:
+            st.subheader("Stage 3: Biking distance analysis")
+            for criterion in bike_criteria:
+                with st.spinner(f"Analyzing {criterion['location']} (bike)..."):
+                    criterion_name = f"{criterion['location'][:20]}_bike"
+                    
+                    st.session_state.analyzer.add_two_stage_location_criterion(
+                        specific_location=criterion['location'],
+                        max_time_minutes=int(criterion['value']),
+                        travel_mode='bike',
+                        criterion_name=criterion_name
+                    )
+        
+        # Stage 4: Process drive criteria with two-stage search
+        if drive_criteria:
+            st.subheader("Stage 4: Driving distance analysis")
+            for criterion in drive_criteria:
+                with st.spinner(f"Analyzing {criterion['location']} (drive)..."):
+                    criterion_name = f"{criterion['location'][:20]}_drive"
+                    
+                    st.session_state.analyzer.add_two_stage_location_criterion(
+                        specific_location=criterion['location'],
+                        max_time_minutes=int(criterion['value']),
+                        travel_mode='drive',
                         criterion_name=criterion_name
                     )
         
@@ -669,17 +675,17 @@ else:
     with col1:
         st.markdown("""
         **Family-Friendly Neighborhood**
-        - Near elementary schools (walking distance)
-        - Close to parks (biking distance)
-        - Grocery stores within 5-minute drive
-        - Near specific daycare center
+        - Near elementary schools (1 mile radius)
+        - Close to parks (2 mile radius)
+        - Grocery stores within 3 miles
+        - Near specific daycare (10 min walk)
         """)
     
     with col2:
         st.markdown("""
         **Urban Professional**
-        - Walking distance to coffee shops
-        - Near public transit stops
-        - Gym within biking distance
-        - Close to specific workplace address
+        - Walking distance to coffee shops (0.5 miles)
+        - Near public transit stops (0.25 miles)
+        - Gym within 1 mile
+        - Close to workplace (15 min drive)
         """)
