@@ -58,7 +58,7 @@ class LocationAnalyzer:
     TRAVEL_SPEEDS = {
         'walk': 3.0,
         'bike': 12.0,
-        'drive': 30.0
+        'drive': 55.0
     }
     
     BUFFER_ADJUSTMENTS = {
@@ -180,10 +180,10 @@ class LocationAnalyzer:
             )
     
     def add_two_stage_location_criterion(self,
-                                       specific_location: str,
-                                       max_time_minutes: int,
-                                       travel_mode: str,
-                                       criterion_name: str) -> gpd.GeoDataFrame:
+                                    specific_location: str,
+                                    max_time_minutes: int,
+                                    travel_mode: str,
+                                    criterion_name: str) -> gpd.GeoDataFrame:
         """Two-stage search for specific locations: buffer first, then network analysis."""
         st.info(f"🔍 Two-stage search for {specific_location}")
         
@@ -191,7 +191,7 @@ class LocationAnalyzer:
         speed_mph = self.TRAVEL_SPEEDS[travel_mode]
         max_distance_miles = (max_time_minutes / 60) * speed_mph
         adjustment = self.BUFFER_ADJUSTMENTS[travel_mode]
-        buffer_distance = max_distance_miles * adjustment  # Slightly larger buffer for safety
+        buffer_distance = max_distance_miles * adjustment
         
         # Get the specific location
         pois = self._get_pois(None, specific_location)
@@ -216,46 +216,111 @@ class LocationAnalyzer:
             location_point = pois.geometry.iloc[0]
             
             # Download street network for the buffer area only
+            # IMPORTANT: Use correct network type for each mode
+            network_type = 'walk' if travel_mode == 'walk' else 'drive'
+            
             G = ox.graph_from_polygon(
-                buffer_gdf.geometry.iloc[0],
-                network_type=travel_mode,
+                stage1_area,  # Use the stage 1 area, not the full buffer
+                network_type=network_type,
                 simplify=True
             )
+            
+            # Add travel time to edges (this is crucial for correct calculations)
+            # Convert edge lengths to travel time in seconds
+            for u, v, data in G.edges(data=True):
+                # length is in meters
+                length_meters = data['length']
+                
+                # Convert to travel time based on mode
+                if travel_mode == 'walk':
+                    # Walking: 3 mph = 1.34 m/s
+                    travel_time_seconds = length_meters / 1.34
+                elif travel_mode == 'bike':
+                    # Biking: 12 mph = 5.36 m/s
+                    travel_time_seconds = length_meters / 5.36
+                else:  # drive
+                    # Driving: Need to consider road type for accurate speeds
+                    # Default to 55 mph  for now
+                    # In reality, should use road class (highway vs residential)
+                    if 'highway' in data:
+                        # Adjust speed based on road type
+                        road_type = data['highway']
+                        if isinstance(road_type, list):
+                            road_type = road_type[0]
+                        
+                        # Speed limits by road type (mph)
+                        speed_limits = {
+                            'motorway': 65,
+                            'trunk': 55,
+                            'primary': 45,
+                            'secondary': 35,
+                            'tertiary': 30,
+                            'residential': 25,
+                            'living_street': 15,
+                            'service': 15
+                        }
+                        
+                        speed_mph = speed_limits.get(road_type, 55)
+                        speed_mps = speed_mph * 0.44704  # Convert mph to m/s
+                    else:
+                        speed_mps = 55 * 0.44704  # Default 55 mph
+                    
+                    travel_time_seconds = length_meters / speed_mps
+                
+                data['travel_time'] = travel_time_seconds
             
             # Find nearest node to the specific location
             location_node = ox.nearest_nodes(G, location_point.x, location_point.y)
             
             # Calculate travel times from this node
+            # Use travel_time as weight, not length!
+            max_time_seconds = max_time_minutes * 60
+            
             travel_times = nx.single_source_dijkstra_path_length(
-                G, location_node, cutoff=max_time_minutes * 60 * self.TRAVEL_SPEEDS[travel_mode] / 3.6,
-                weight='length'
+                G, 
+                location_node, 
+                cutoff=max_time_seconds,
+                weight='travel_time'  # Use travel time, not distance!
             )
             
             # Create isochrone from reachable nodes
-            reachable_nodes = []
-            for node, time in travel_times.items():
-                if time <= max_time_minutes * 60 * self.TRAVEL_SPEEDS[travel_mode] / 3.6:
-                    reachable_nodes.append(node)
-            
-            if reachable_nodes:
-                # Get node coordinates
-                node_points = []
-                for node in reachable_nodes:
-                    node_data = G.nodes[node]
-                    node_points.append(Point(node_data['x'], node_data['y']))
+            if travel_times:
+                # Get coordinates of all reachable nodes
+                node_coords = []
+                for node, time_seconds in travel_times.items():
+                    if time_seconds <= max_time_seconds:
+                        node_data = G.nodes[node]
+                        node_coords.append([node_data['x'], node_data['y']])
                 
-                # Create convex hull of reachable points
-                points_gdf = gpd.GeoDataFrame(geometry=node_points, crs=self.crs)
-                isochrone = points_gdf.unary_union.convex_hull
-                
-                # Intersect with current search area
-                result_geometry = isochrone.intersection(self.current_search_area)
-                
-                st.success(f"✅ Stage 2: Network analysis complete")
+                if len(node_coords) > 2:
+                    # Create a more accurate isochrone using alpha shape or concave hull
+                    from shapely.geometry import MultiPoint
+                    from shapely.ops import unary_union
+                    
+                    points = MultiPoint([Point(coord) for coord in node_coords])
+                    
+                    # For driving, use convex hull (simpler but still accurate)
+                    # For walking/biking, could use alpha shape for more detail
+                    if travel_mode == 'drive':
+                        isochrone = points.convex_hull
+                    else:
+                        # Use buffer + union for more organic shape
+                        buffer_size = 0.001 if travel_mode == 'walk' else 0.002
+                        buffered_points = [Point(coord).buffer(buffer_size) for coord in node_coords]
+                        isochrone = unary_union(buffered_points).convex_hull
+                    
+                    # Intersect with current search area
+                    result_geometry = isochrone.intersection(self.current_search_area)
+                    
+                    st.success(f"✅ Stage 2: Network analysis complete ({len(node_coords)} reachable nodes)")
+                else:
+                    # Not enough reachable nodes
+                    st.warning("⚠️ Too few reachable nodes found, using buffer method")
+                    result_geometry = stage1_area
             else:
-                # Fallback to buffered area if no reachable nodes
+                # No reachable nodes found
+                st.warning("⚠️ No reachable areas found via network, using buffer method")
                 result_geometry = stage1_area
-                st.warning("⚠️ Network analysis found no reachable areas, using buffer method")
                 
         except Exception as e:
             # If network analysis fails, use the buffer result
@@ -267,14 +332,15 @@ class LocationAnalyzer:
         self.criteria_results.append({
             'name': criterion_name,
             'geometry': result_geometry,
-            'description': f"{travel_mode}: {max_time_minutes} min (network-based)"
+            'description': f"{travel_mode}: {max_time_minutes} min (two-stage search)"
         })
         
         area_sq_miles = self._calculate_area_sq_miles(result_geometry)
         st.info(f"✅ Applied {criterion_name}. New area: {area_sq_miles:.1f} sq miles")
         
         return gpd.GeoDataFrame([{'geometry': result_geometry}], crs=self.crs)
-    
+
+
     def _simple_travel_buffer(self, poi_type, specific_location, 
                              max_distance_miles, travel_mode, criterion_name):
         """Simple buffer adjusted for travel mode."""
