@@ -9,6 +9,9 @@ import folium
 import networkx as nx
 from typing import List, Dict, Union, Tuple, Optional
 import warnings
+import time
+import functools
+
 warnings.filterwarnings('ignore')
 
 # Configure OSMnx
@@ -50,6 +53,136 @@ POI_TYPES = {
     "Swimming Pool": {'leisure': 'swimming_pool'},
     "Museum": {'tourism': 'museum'}
 }
+
+
+# Cache geocoding results to avoid repeated API calls
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def validate_location(location_string, location_type='general'):
+    """
+    Validate and geocode a location with helpful error messages.
+    
+    Args:
+        location_string: User input location
+        location_type: 'city' or 'address' for specific formatting hints
+    
+    Returns:
+        dict with 'valid', 'lat', 'lon', 'display_name', 'error_message'
+    """
+    try:
+        # Try different geocoding approaches
+        attempts = []
+        
+        # Attempt 1: Direct geocoding
+        try:
+            result = ox.geocode_to_gdf(location_string)
+            lat = result.geometry.iloc[0].centroid.y
+            lon = result.geometry.iloc[0].centroid.x
+            display_name = result['display_name'].iloc[0] if 'display_name' in result.columns else location_string
+            
+            return {
+                'valid': True,
+                'lat': lat,
+                'lon': lon,
+                'display_name': display_name,
+                'error_message': None
+            }
+        except:
+            attempts.append("Direct search")
+        
+        # Attempt 2: Try with country suffix if it looks like a city
+        if location_type == 'city' and ',' not in location_string:
+            common_suffixes = [', USA', ', United States', ', US', ', North Carolina', ', NC']
+            for suffix in common_suffixes:
+                try:
+                    result = ox.geocode_to_gdf(location_string + suffix)
+                    lat = result.geometry.iloc[0].centroid.y
+                    lon = result.geometry.iloc[0].centroid.x
+                    display_name = result['display_name'].iloc[0] if 'display_name' in result.columns else location_string
+                    
+                    return {
+                        'valid': True,
+                        'lat': lat,
+                        'lon': lon,
+                        'display_name': display_name,
+                        'error_message': f"Found as: {location_string + suffix}"
+                    }
+                except:
+                    attempts.append(f"with suffix '{suffix}'")
+        
+        # If all attempts failed
+        error_msg = f"Could not find '{location_string}'. "
+        
+        if location_type == 'city':
+            error_msg += "Try format: 'City, State' or 'City, Country' (e.g., 'Durham, NC' or 'Paris, France')"
+        else:
+            error_msg += "Try being more specific: add street number, city, state, or ZIP code"
+        
+        return {
+            'valid': False,
+            'lat': None,
+            'lon': None,
+            'display_name': None,
+            'error_message': error_msg
+        }
+        
+    except Exception as e:
+        return {
+            'valid': False,
+            'lat': None,
+            'lon': None,
+            'display_name': None,
+            'error_message': f"Geocoding error: {str(e)}"
+        }
+
+def location_input_with_validation(label, key, location_type='general', help_text=None, value=""):
+    """
+    Enhanced location input with validation feedback.
+    
+    Returns:
+        Validated location string or None if invalid
+    """
+    col1, col2 = st.columns([4, 1])
+    
+    with col1:
+        location = st.text_input(
+            label,
+            key=f"{key}_input",
+            help=help_text or "Enter a location",
+            value=value
+        )
+    
+    with col2:
+        if location:
+            # Validate location
+            validation = validate_location(location, location_type)
+            
+            if validation['valid']:
+                st.success("✓")
+                if validation.get('error_message'):  # Show if location was adjusted
+                    st.caption(validation['error_message'])
+                
+                # Store validated info in session state
+                st.session_state[f"{key}_validated"] = {
+                    'location': location,
+                    'display_name': validation['display_name'],
+                    'lat': validation['lat'],
+                    'lon': validation['lon']
+                }
+                return location
+            else:
+                st.error("✗")
+                st.error(validation['error_message'])
+                st.session_state[f"{key}_validated"] = None
+                return None
+        else:
+            # Clear validation if input is empty
+            if f"{key}_validated" in st.session_state:
+                del st.session_state[f"{key}_validated"]
+    
+    return location if location else None
+
+
+
 
 # LocationAnalyzer class (keep all existing methods unchanged)
 class LocationAnalyzer:
@@ -464,9 +597,24 @@ with st.sidebar:
     st.subheader("1. Search Area")
     col1, col2 = st.columns([2, 1])
     with col1:
-        center_location = st.text_input("City or Location", value="Durham, NC")
+        # Use the enhanced location input
+        center_location = location_input_with_validation(
+            "City or Location",
+            key="center_location",
+            location_type='city',
+            help_text="Examples: 'Durham, NC', 'New York, NY', 'Los Angeles, CA'",
+            value="Durham, NC"
+        )
+        
+        # Show validation status if available
+        if center_location and "center_location_validated" in st.session_state:
+            validated = st.session_state["center_location_validated"]
+            if validated:
+                st.caption(f"📍 {validated['display_name'][:60]}...")
+                
     with col2:
         max_radius = st.selectbox("Radius (miles)", options=list(range(1, 26)), index=9)
+
     
     st.divider()
     
@@ -508,28 +656,42 @@ with st.sidebar:
     
     for i in range(4):
         with st.expander(f"Location Criterion {i+1}", expanded=(i==0)):
-            specific_loc = st.text_input("Location/Address", key=f"loc_{i}")
+            # Enhanced location input with validation
+            specific_loc = location_input_with_validation(
+                "Location/Address",
+                key=f"loc_{i}",
+                location_type='address',
+                help_text="Examples: 'Duke Hospital, Durham, NC' or '123 Main St, Durham, NC 27701'"
+            )
             
-            col1, col2 = st.columns(2)
-            with col1:
-                mode = st.selectbox(
-                    "Mode",
-                    options=["distance", "walk", "bike", "drive"],
-                    key=f"loc_mode_{i}"
-                )
-            with col2:
-                if mode == "distance":
-                    value = st.number_input("Miles", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key=f"loc_value_{i}")
+            # Only show mode/value options if location is valid
+            if specific_loc and f"loc_{i}_validated" in st.session_state:
+                validated = st.session_state[f"loc_{i}_validated"]
+                if validated:
+                    st.caption(f"📍 Found: {validated['display_name'][:80]}...")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        mode = st.selectbox(
+                            "Mode",
+                            options=["distance", "walk", "bike", "drive"],
+                            key=f"loc_mode_{i}"
+                        )
+                    with col2:
+                        if mode == "distance":
+                            value = st.number_input("Miles", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key=f"loc_value_{i}")
+                        else:
+                            value = st.number_input("Minutes", min_value=1, max_value=60, value=10, step=1, key=f"loc_value_{i}")
+                    
+                    location_criteria.append({
+                        'location': specific_loc,
+                        'mode': mode,
+                        'value': value,
+                        'validated_data': validated  # Store the validated data
+                    })
                 else:
-                    value = st.number_input("Minutes", min_value=1, max_value=60, value=10, step=1, key=f"loc_value_{i}")
-            
-            if specific_loc:
-                location_criteria.append({
-                    'location': specific_loc,
-                    'mode': mode,
-                    'value': value
-                })
-    
+                    st.warning("Please enter a valid location")
+   
     st.divider()
     
     # Analyze button
@@ -537,88 +699,92 @@ with st.sidebar:
 
 # Main content area
 if analyze_button:
-    try:
-        # Initialize analyzer
-        with st.spinner("Initializing search area..."):
-            st.session_state.analyzer = LocationAnalyzer(center_location, max_radius)
-        
-        # Apply amenity criteria (all are distance-based now)
-        for idx, criterion in enumerate(amenity_criteria):
-            with st.spinner(f"Analyzing {criterion['poi_name']}..."):
-                criterion_name = f"{criterion['poi_name']}_distance"
-                
-                st.session_state.analyzer.add_simple_buffer_criterion(
-                    poi_type=criterion['poi_type'],
-                    max_distance_miles=criterion['value'],
-                    criterion_name=criterion_name
-                )
-        
-        # UPDATED: Process location criteria in stages
-        # First, separate criteria by mode
-        distance_criteria = [c for c in location_criteria if c['mode'] == 'distance']
-        walk_criteria = [c for c in location_criteria if c['mode'] == 'walk']
-        bike_criteria = [c for c in location_criteria if c['mode'] == 'bike']
-        drive_criteria = [c for c in location_criteria if c['mode'] == 'drive']
-        
-        # Stage 1: Process all distance-based criteria first
-        st.subheader("Stage 1: Distance-based filtering")
-        for criterion in distance_criteria:
-            with st.spinner(f"Analyzing {criterion['location']} (distance)..."):
-                criterion_name = f"{criterion['location'][:20]}_distance"
-                
-                st.session_state.analyzer.add_simple_buffer_criterion(
-                    specific_location=criterion['location'],
-                    max_distance_miles=criterion['value'],
-                    criterion_name=criterion_name
-                )
-        
-        # Stage 2: Process walk criteria with two-stage search
-        if walk_criteria:
-            st.subheader("Stage 2: Walking distance analysis")
-            for criterion in walk_criteria:
-                with st.spinner(f"Analyzing {criterion['location']} (walk)..."):
-                    criterion_name = f"{criterion['location'][:20]}_walk"
+    # Check if center location is valid
+    if not center_location or f"center_location_validated" not in st.session_state:
+        st.error("❌ Please enter a valid center location before analyzing.")
+    else:
+        try:
+            # Initialize analyzer
+            with st.spinner("Initializing search area..."):
+                st.session_state.analyzer = LocationAnalyzer(center_location, max_radius)
+                       
+            # Apply amenity criteria (all are distance-based now)
+            for idx, criterion in enumerate(amenity_criteria):
+                with st.spinner(f"Analyzing {criterion['poi_name']}..."):
+                    criterion_name = f"{criterion['poi_name']}_distance"
                     
-                    st.session_state.analyzer.add_two_stage_location_criterion(
-                        specific_location=criterion['location'],
-                        max_time_minutes=int(criterion['value']),
-                        travel_mode='walk',
+                    st.session_state.analyzer.add_simple_buffer_criterion(
+                        poi_type=criterion['poi_type'],
+                        max_distance_miles=criterion['value'],
                         criterion_name=criterion_name
                     )
-        
-        # Stage 3: Process bike criteria with two-stage search
-        if bike_criteria:
-            st.subheader("Stage 3: Biking distance analysis")
-            for criterion in bike_criteria:
-                with st.spinner(f"Analyzing {criterion['location']} (bike)..."):
-                    criterion_name = f"{criterion['location'][:20]}_bike"
+            
+            # UPDATED: Process location criteria in stages
+            # First, separate criteria by mode
+            distance_criteria = [c for c in location_criteria if c['mode'] == 'distance']
+            walk_criteria = [c for c in location_criteria if c['mode'] == 'walk']
+            bike_criteria = [c for c in location_criteria if c['mode'] == 'bike']
+            drive_criteria = [c for c in location_criteria if c['mode'] == 'drive']
+            
+            # Stage 1: Process all distance-based criteria first
+            st.subheader("Stage 1: Distance-based filtering")
+            for criterion in distance_criteria:
+                with st.spinner(f"Analyzing {criterion['location']} (distance)..."):
+                    criterion_name = f"{criterion['location'][:20]}_distance"
                     
-                    st.session_state.analyzer.add_two_stage_location_criterion(
+                    st.session_state.analyzer.add_simple_buffer_criterion(
                         specific_location=criterion['location'],
-                        max_time_minutes=int(criterion['value']),
-                        travel_mode='bike',
+                        max_distance_miles=criterion['value'],
                         criterion_name=criterion_name
                     )
-        
-        # Stage 4: Process drive criteria with two-stage search
-        if drive_criteria:
-            st.subheader("Stage 4: Driving distance analysis")
-            for criterion in drive_criteria:
-                with st.spinner(f"Analyzing {criterion['location']} (drive)..."):
-                    criterion_name = f"{criterion['location'][:20]}_drive"
-                    
-                    st.session_state.analyzer.add_two_stage_location_criterion(
-                        specific_location=criterion['location'],
-                        max_time_minutes=int(criterion['value']),
-                        travel_mode='drive',
-                        criterion_name=criterion_name
-                    )
-        
-        st.success("✅ Analysis complete!")
-        
-    except Exception as e:
-        st.error(f"Error during analysis: {str(e)}")
-        st.session_state.analyzer = None
+            
+            # Stage 2: Process walk criteria with two-stage search
+            if walk_criteria:
+                st.subheader("Stage 2: Walking distance analysis")
+                for criterion in walk_criteria:
+                    with st.spinner(f"Analyzing {criterion['location']} (walk)..."):
+                        criterion_name = f"{criterion['location'][:20]}_walk"
+                        
+                        st.session_state.analyzer.add_two_stage_location_criterion(
+                            specific_location=criterion['location'],
+                            max_time_minutes=int(criterion['value']),
+                            travel_mode='walk',
+                            criterion_name=criterion_name
+                        )
+            
+            # Stage 3: Process bike criteria with two-stage search
+            if bike_criteria:
+                st.subheader("Stage 3: Biking distance analysis")
+                for criterion in bike_criteria:
+                    with st.spinner(f"Analyzing {criterion['location']} (bike)..."):
+                        criterion_name = f"{criterion['location'][:20]}_bike"
+                        
+                        st.session_state.analyzer.add_two_stage_location_criterion(
+                            specific_location=criterion['location'],
+                            max_time_minutes=int(criterion['value']),
+                            travel_mode='bike',
+                            criterion_name=criterion_name
+                        )
+            
+            # Stage 4: Process drive criteria with two-stage search
+            if drive_criteria:
+                st.subheader("Stage 4: Driving distance analysis")
+                for criterion in drive_criteria:
+                    with st.spinner(f"Analyzing {criterion['location']} (drive)..."):
+                        criterion_name = f"{criterion['location'][:20]}_drive"
+                        
+                        st.session_state.analyzer.add_two_stage_location_criterion(
+                            specific_location=criterion['location'],
+                            max_time_minutes=int(criterion['value']),
+                            travel_mode='drive',
+                            criterion_name=criterion_name
+                        )
+            
+            st.success("✅ Analysis complete!")
+            
+        except Exception as e:
+            st.error(f"Error during analysis: {str(e)}")
+            st.session_state.analyzer = None
 
 # Display results
 if st.session_state.analyzer:
@@ -666,6 +832,43 @@ if st.session_state.analyzer:
 else:
     # Welcome message
     st.info("👆 Configure your search parameters in the sidebar and click 'Analyze Location' to begin.")
+    
+    # Add location format guide
+    with st.expander("📍 Location Input Tips", expanded=True):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            **✅ Good Location Formats:**
+            - `Durham, NC`
+            - `Raleigh, North Carolina`
+            - `Duke University, Durham, NC`
+            - `123 Main Street, Durham, NC 27701`
+            - `Central Park, New York, NY`
+            - `RDU Airport, NC`
+            - `Whole Foods, Chapel Hill, NC`
+            """)
+        
+        with col2:
+            st.markdown("""
+            **❌ Formats to Avoid:**
+            - `Durham` (too vague - add state)
+            - `Main Street` (add city/state)
+            - `The mall` (be specific)
+            - `Near the airport` (use exact name)
+            - `Downtown` (specify which city)
+            - Misspellings or uncommon abbreviations
+            """)
+        
+        st.markdown("""
+        **💡 Pro Tips:**
+        - Add state abbreviation (NC, NY, CA) or full state name
+        - For addresses, include ZIP code when possible
+        - For landmarks, use official names (e.g., "Duke University Hospital" not "Duke Hospital")
+        - If search fails, try adding more context (city, state, country)
+        - The green checkmark (✓) means the location was found successfully
+        - If you see a red X (✗), try a different format based on the error message
+        """)
     
     # Example configurations
     st.subheader("Example Use Cases")
